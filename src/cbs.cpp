@@ -142,6 +142,26 @@ namespace cbs {
     };
   }
 
+  std::optional<bool> h264_entropy_coding_mode(const AVPacket *packet) {
+    cbs::ctx_t ctx;
+    if (ff_cbs_init(&ctx, AV_CODEC_ID_H264, nullptr)) {
+      return std::nullopt;
+    }
+
+    cbs::frag_t frag;
+    int err = ff_cbs_read_packet(ctx.get(), &frag, packet);
+    if (err < 0) {
+      return std::nullopt;
+    }
+
+    auto *h264 = (CodedBitstreamH264Context *) ctx->priv_data;
+    if (!h264 || !h264->active_pps) {
+      return std::nullopt;
+    }
+
+    return h264->active_pps->entropy_coding_mode_flag != 0;
+  }
+
   hevc_t make_sps_hevc(const AVCodecContext *avctx, const AVPacket *packet) {
     cbs::ctx_t ctx;
     if (ff_cbs_init(&ctx, AV_CODEC_ID_H265, nullptr)) {

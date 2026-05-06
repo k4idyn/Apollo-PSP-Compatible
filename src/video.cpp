@@ -128,6 +128,16 @@ namespace video {
 
   }  // namespace qsv
 
+  namespace amf {
+
+    enum class coder_h264_e : int {
+      automatic = 0,
+      cabac = 1,
+      cavlc = 2,
+    };
+
+  }  // namespace amf
+
   util::Either<avcodec_buffer_t, int> dxgi_init_avcodec_hardware_input_buffer(platf::avcodec_encode_device_t *);
   util::Either<avcodec_buffer_t, int> vaapi_init_avcodec_hardware_input_buffer(platf::avcodec_encode_device_t *);
   util::Either<avcodec_buffer_t, int> cuda_init_avcodec_hardware_input_buffer(platf::avcodec_encode_device_t *);
@@ -316,10 +326,11 @@ namespace video {
   public:
     avcodec_encode_session_t() = default;
 
-    avcodec_encode_session_t(avcodec_ctx_t &&avcodec_ctx, std::unique_ptr<platf::avcodec_encode_device_t> encode_device, int inject):
+    avcodec_encode_session_t(avcodec_ctx_t &&avcodec_ctx, std::unique_ptr<platf::avcodec_encode_device_t> encode_device, int inject, std::optional<bool> expected_h264_cabac):
         avcodec_ctx {std::move(avcodec_ctx)},
         device {std::move(encode_device)},
-        inject {inject} {
+        inject {inject},
+        expected_h264_cabac {expected_h264_cabac} {
     }
 
     avcodec_encode_session_t(avcodec_encode_session_t &&other) noexcept = default;
@@ -345,6 +356,8 @@ namespace video {
       vps = std::move(other.vps);
 
       inject = other.inject;
+      expected_h264_cabac = other.expected_h264_cabac;
+      h264_entropy_mode_checked = other.h264_entropy_mode_checked;
 
       return *this;
     }
@@ -387,6 +400,10 @@ namespace video {
 
     // inject sps/vps data into idr pictures
     int inject;
+
+    std::optional<bool> expected_h264_cabac;
+    bool h264_entropy_mode_checked {false};
+    bool h264_entropy_mode_probe_warned {false};
   };
 
   class nvenc_encode_session_t: public encode_session_t {
@@ -820,6 +837,19 @@ namespace video {
         {"quality"s, &config::video.amd.amd_quality_h264},
         {"rc"s, &config::video.amd.amd_rc_h264},
         {"usage"s, &config::video.amd.amd_usage_h264},
+        {"profile"s, [](const config_t &) {
+           const auto coder = config::video.amd.amd_coder;
+           if (coder == (int) amf::coder_h264_e::cavlc) {
+             return "constrained_baseline"s;
+           }
+
+           if (coder == (int) amf::coder_h264_e::cabac) {
+             return "high"s;
+           }
+
+           return "auto"s;
+         }},
+        {"coder"s, &config::video.amd.amd_coder},
         {"vbaq"s, &config::video.amd.amd_vbaq},
         {"enforce_hrd"s, &config::video.amd.amd_enforce_hrd},
       },
@@ -1465,6 +1495,26 @@ namespace video {
         );
       }
 
+      if (!session.h264_entropy_mode_checked && session.expected_h264_cabac) {
+        auto entropy_mode = cbs::h264_entropy_coding_mode(av_packet);
+        if (entropy_mode.has_value()) {
+          session.h264_entropy_mode_checked = true;
+          if (*entropy_mode != *session.expected_h264_cabac) {
+            BOOST_LOG(error)
+              << "H.264 entropy coding mode mismatch. Requested "sv
+              << (*session.expected_h264_cabac ? "CABAC"sv : "CAVLC"sv)
+              << ", but output bitstream uses "sv
+              << (*entropy_mode ? "CABAC"sv : "CAVLC"sv)
+              << "."sv;
+          } else {
+            BOOST_LOG(info) << "H.264 entropy coding mode in output bitstream: "sv << (*entropy_mode ? "CABAC"sv : "CAVLC"sv) << '.';
+          }
+        } else if (!session.h264_entropy_mode_probe_warned) {
+          session.h264_entropy_mode_probe_warned = true;
+          BOOST_LOG(warning) << "Unable to verify H.264 entropy coding mode from current packet; will continue probing subsequent packets."sv;
+        }
+      }
+
       if (av_packet && av_packet->pts == frame_nr) {
         packet->frame_timestamp = frame_timestamp;
       }
@@ -1569,7 +1619,11 @@ namespace video {
         case 0:
           // 10-bit h264 encoding is not supported by our streaming protocol
           assert(!config.dynamicRange);
-          ctx->profile = (config.chromaSamplingType == 1) ? AV_PROFILE_H264_HIGH_444_PREDICTIVE : AV_PROFILE_H264_HIGH;
+          if (encoder.name == "amdvce"sv && config::video.amd.amd_coder == (int) amf::coder_h264_e::cavlc) {
+            ctx->profile = AV_PROFILE_H264_CONSTRAINED_BASELINE;
+          } else {
+            ctx->profile = (config.chromaSamplingType == 1) ? AV_PROFILE_H264_HIGH_444_PREDICTIVE : AV_PROFILE_H264_HIGH;
+          }
           break;
 
         case 1:
@@ -1694,6 +1748,9 @@ namespace video {
       ctx->thread_count = ctx->slices;
 
       AVDictionary *options {nullptr};
+      [[maybe_unused]] auto options_guard = util::fail_guard([&options]() {
+        av_dict_free(&options);
+      });
       auto handle_option = [&options, &config](const encoder_t::option_t &option) {
         std::visit(
           util::overloaded {
@@ -1800,6 +1857,13 @@ namespace video {
         }
       }
 
+      if (options) {
+        AVDictionaryEntry *entry = nullptr;
+        while ((entry = av_dict_get(options, "", entry, AV_DICT_IGNORE_SUFFIX))) {
+          BOOST_LOG(warning) << "Codec ["sv << video_format.name << "] ignored option ["sv << entry->key << '=' << entry->value << ']';
+        }
+      }
+
       // Successfully opened the codec
       break;
     }
@@ -1868,12 +1932,23 @@ namespace video {
 
     encode_device_final->apply_colorspace();
 
+    std::optional<bool> expected_h264_cabac;
+    if (encoder.name == "amdvce"sv && config.videoFormat == 0) {
+      const auto coder = config::video.amd.amd_coder;
+      if (coder == (int) amf::coder_h264_e::cabac) {
+        expected_h264_cabac = true;
+      } else if (coder == (int) amf::coder_h264_e::cavlc) {
+        expected_h264_cabac = false;
+      }
+    }
+
     auto session = std::make_unique<avcodec_encode_session_t>(
       std::move(ctx),
       std::move(encode_device_final),
 
       // 0 ==> don't inject, 1 ==> inject for h264, 2 ==> inject for hevc
-      config.videoFormat <= 1 ? (1 - (int) video_format[encoder_t::VUI_PARAMETERS]) * (1 + config.videoFormat) : 0
+      config.videoFormat <= 1 ? (1 - (int) video_format[encoder_t::VUI_PARAMETERS]) * (1 + config.videoFormat) : 0,
+      expected_h264_cabac
     );
 
     return session;
@@ -2536,6 +2611,11 @@ namespace video {
 
     auto test_hevc = active_hevc_mode >= 2 || (active_hevc_mode == 0 && !(encoder.flags & H264_ONLY));
     auto test_av1 = active_av1_mode >= 2 || (active_av1_mode == 0 && !(encoder.flags & H264_ONLY));
+    const auto skip_active_validation = encoder.name == "amdvce";
+
+    if (skip_active_validation) {
+      BOOST_LOG(warning) << "Skipping active validation for encoder ["sv << encoder.name << "] due to a known AMF probe hang; using capability-only checks"sv;
+    }
 
     encoder.h264.capabilities.set();
     encoder.hevc.capabilities.set();
@@ -2558,13 +2638,19 @@ namespace video {
 
     // If we're expecting failure, use the autoselect ref config first since that will always succeed
     // if the encoder is available.
-    auto max_ref_frames_h264 = expect_failure ? -1 : validate_config(disp, encoder, config_max_ref_frames);
-    auto autoselect_h264 = max_ref_frames_h264 >= 0 ? max_ref_frames_h264 : validate_config(disp, encoder, config_autoselect);
-    if (autoselect_h264 < 0) {
-      return false;
-    } else if (expect_failure) {
-      // We expected failure, but actually succeeded. Do the max_ref_frames probe we skipped.
-      max_ref_frames_h264 = validate_config(disp, encoder, config_max_ref_frames);
+    int max_ref_frames_h264 = -1;
+    int autoselect_h264 = -1;
+    if (skip_active_validation) {
+      autoselect_h264 = 0;
+    } else {
+      max_ref_frames_h264 = expect_failure ? -1 : validate_config(disp, encoder, config_max_ref_frames);
+      autoselect_h264 = max_ref_frames_h264 >= 0 ? max_ref_frames_h264 : validate_config(disp, encoder, config_autoselect);
+      if (autoselect_h264 < 0) {
+        return false;
+      } else if (expect_failure) {
+        // We expected failure, but actually succeeded. Do the max_ref_frames probe we skipped.
+        max_ref_frames_h264 = validate_config(disp, encoder, config_max_ref_frames);
+      }
     }
 
     std::vector<std::pair<validate_flag_e, encoder_t::flag_e>> packet_deficiencies {
@@ -2583,13 +2669,19 @@ namespace video {
       config_autoselect.videoFormat = 1;
 
       if (disp->is_codec_supported(encoder.hevc.name, config_autoselect)) {
-        auto max_ref_frames_hevc = validate_config(disp, encoder, config_max_ref_frames);
+        int max_ref_frames_hevc = -1;
+        int autoselect_hevc = -1;
+        if (skip_active_validation) {
+          autoselect_hevc = 0;
+        } else {
+          max_ref_frames_hevc = validate_config(disp, encoder, config_max_ref_frames);
 
-        // If H.264 succeeded with max ref frames specified, assume that we can count on
-        // HEVC to also succeed with max ref frames specified if HEVC is supported.
-        auto autoselect_hevc = (max_ref_frames_hevc >= 0 || max_ref_frames_h264 >= 0) ?
-                                 max_ref_frames_hevc :
-                                 validate_config(disp, encoder, config_autoselect);
+          // If H.264 succeeded with max ref frames specified, assume that we can count on
+          // HEVC to also succeed with max ref frames specified if HEVC is supported.
+          autoselect_hevc = (max_ref_frames_hevc >= 0 || max_ref_frames_h264 >= 0) ?
+                              max_ref_frames_hevc :
+                              validate_config(disp, encoder, config_autoselect);
+        }
 
         for (auto [validate_flag, encoder_flag] : packet_deficiencies) {
           encoder.hevc[encoder_flag] = (max_ref_frames_hevc & validate_flag && autoselect_hevc & validate_flag);
@@ -2611,13 +2703,19 @@ namespace video {
       config_autoselect.videoFormat = 2;
 
       if (disp->is_codec_supported(encoder.av1.name, config_autoselect)) {
-        auto max_ref_frames_av1 = validate_config(disp, encoder, config_max_ref_frames);
+        int max_ref_frames_av1 = -1;
+        int autoselect_av1 = -1;
+        if (skip_active_validation) {
+          autoselect_av1 = 0;
+        } else {
+          max_ref_frames_av1 = validate_config(disp, encoder, config_max_ref_frames);
 
-        // If H.264 succeeded with max ref frames specified, assume that we can count on
-        // AV1 to also succeed with max ref frames specified if AV1 is supported.
-        auto autoselect_av1 = (max_ref_frames_av1 >= 0 || max_ref_frames_h264 >= 0) ?
-                                max_ref_frames_av1 :
-                                validate_config(disp, encoder, config_autoselect);
+          // If H.264 succeeded with max ref frames specified, assume that we can count on
+          // AV1 to also succeed with max ref frames specified if AV1 is supported.
+          autoselect_av1 = (max_ref_frames_av1 >= 0 || max_ref_frames_h264 >= 0) ?
+                            max_ref_frames_av1 :
+                            validate_config(disp, encoder, config_autoselect);
+        }
 
         for (auto [validate_flag, encoder_flag] : packet_deficiencies) {
           encoder.av1[encoder_flag] = (max_ref_frames_av1 & validate_flag && autoselect_av1 & validate_flag);
@@ -2635,7 +2733,14 @@ namespace video {
     }
 
     // Test HDR and YUV444 support
-    {
+    if (skip_active_validation) {
+      encoder.h264[encoder_t::YUV444] = false;
+      encoder.h264[encoder_t::DYNAMIC_RANGE] = false;
+      encoder.hevc[encoder_t::YUV444] = false;
+      encoder.hevc[encoder_t::DYNAMIC_RANGE] = false;
+      encoder.av1[encoder_t::YUV444] = false;
+      encoder.av1[encoder_t::DYNAMIC_RANGE] = false;
+    } else {
       // H.264 is special because encoders may support YUV 4:4:4 without supporting 10-bit color depth
       if (encoder.flags & YUV444_SUPPORT) {
         config_t config_h264_yuv444 {1920, 1080, 60, 1000, 1, 0, 1, 0, 0, 1};

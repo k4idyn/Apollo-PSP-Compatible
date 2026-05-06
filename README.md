@@ -85,6 +85,32 @@ Here're some common causes and solutions for stutters: [WiKi](https://github.com
 - Pixel devices might not be able to use native resolution:
   - Change the device resolution to High: https://github.com/ClassicOldSong/Apollo/issues/700
 
+## PSP Compatibility (H.264 CAVLC)
+
+PSP playback is significantly more reliable when the host emits H.264 with CAVLC-compatible settings. In vanilla Sunshine/Apollo paths, AMF H.264 can still end up producing CABAC-style output in scenarios where users expect CAVLC, and the bitstream entropy mode is not explicitly verified at runtime.
+
+### Why this matters
+
+- PSP hardware decoding is strict compared to modern clients.
+- CABAC/high-profile oriented output can fail or behave inconsistently on PSP-focused playback pipelines.
+- A config value alone is not enough if the final encoded bitstream does not match the requested entropy mode.
+
+### What changed in this fork
+
+- AMF H.264 `coder` handling is now wired with profile selection:
+  - `cavlc` -> constrained baseline profile
+  - `cabac` -> high profile
+  - `auto` -> encoder default behavior
+- Runtime bitstream verification was added for H.264 entropy mode (CABAC vs CAVLC), with mismatch logging.
+- AMF active probe/validation is skipped for known hang scenarios and capability-only checks are used there.
+- AMF option parsing for some toggles was normalized to integer values expected by the encoder options path.
+
+### Why it is needed for PSP
+
+The goal is deterministic PSP-safe output: when CAVLC is requested, the encoder path now aligns profile + coder configuration and verifies what is actually produced. This reduces silent fallbacks to incompatible entropy coding and makes troubleshooting visible in logs.
+
+If you are targeting PSP, prefer H.264 with `amd_coder = cavlc` and avoid relying on automatic entropy selection.
+
 ## System Requirements
 
 > **Warning**: This table is a work in progress. Do not purchase hardware based on this.

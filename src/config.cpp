@@ -1166,9 +1166,15 @@ namespace config {
       video.amd.amd_usage_av1 = amd::usage_from_view<amd::usage_av1_e>(usage, video.amd.amd_usage_av1);
     }
 
-    bool_f(vars, "amd_preanalysis", (bool &) video.amd.amd_preanalysis);
-    bool_f(vars, "amd_vbaq", (bool &) video.amd.amd_vbaq);
-    bool_f(vars, "amd_enforce_hrd", (bool &) video.amd.amd_enforce_hrd);
+    int_f(vars, "amd_preanalysis", video.amd.amd_preanalysis, [](std::string value) {
+      return to_bool(value) ? 1 : 0;
+    });
+    int_f(vars, "amd_vbaq", video.amd.amd_vbaq, [](std::string value) {
+      return to_bool(value) ? 1 : 0;
+    });
+    int_f(vars, "amd_enforce_hrd", video.amd.amd_enforce_hrd, [](std::string value) {
+      return to_bool(value) ? 1 : 0;
+    });
 
     int_f(vars, "vt_coder", video.vt.vt_coder, vt::coder_from_view);
     int_f(vars, "vt_software", video.vt.vt_allow_sw, vt::allow_software_from_view);

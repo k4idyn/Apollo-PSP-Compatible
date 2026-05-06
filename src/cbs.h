@@ -7,6 +7,9 @@
 // local includes
 #include "utility.h"
 
+// standard includes
+#include <optional>
+
 struct AVPacket;
 struct AVCodecContext;
 
@@ -28,6 +31,13 @@ namespace cbs {
 
   hevc_t make_sps_hevc(const AVCodecContext *ctx, const AVPacket *packet);
   h264_t make_sps_h264(const AVCodecContext *ctx, const AVPacket *packet);
+
+  /**
+   * @brief Reads active PPS entropy mode from an H.264 packet.
+   * @param packet The packet to inspect.
+   * @return std::optional<bool> where true is CABAC, false is CAVLC, nullopt if unavailable.
+   */
+  std::optional<bool> h264_entropy_coding_mode(const AVPacket *packet);
 
   /**
    * @brief Validates the Sequence Parameter Set (SPS) of a given packet.
